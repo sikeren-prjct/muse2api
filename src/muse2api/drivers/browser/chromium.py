@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
@@ -45,6 +46,10 @@ class ProcessInfo:
 
 
 _USER_DATA_DIR_RE = re.compile(r"--user-data-dir=(?:\"([^\"]+)\"|(\S+))")
+
+# Same flag, three spellings: --user-data-dir="C:\path with spaces",
+# --user-data-dir='C:\path', or --user-data-dir=C:\path (no quotes).
+_WIN_USER_DATA_DIR_RE = re.compile(r"--user-data-dir=(?:\"([^\"]+)\"|'([^']+)'|(\S+))")
 
 
 def _norm_path(raw: str) -> str:
@@ -277,6 +282,8 @@ def _manual_holder_steps(profile_dir: Path, platform: str | None = None) -> str:
 
 
 class ChromiumProcess:
+    PROFILE_IN_USE = 21
+
     def __init__(self, executable: str, port: int, profile_dir: Path, *,
                  headless: bool = True, proxy: str = "", data_dir: Path | None = None):
         self.executable = executable
@@ -310,7 +317,7 @@ class ChromiumProcess:
             self.executable,
             f"--remote-debugging-port={self.port}",
             "--remote-allow-origins=*",
-            f"--user-data-dir={self.profile_dir}",
+            f"--user-data-dir={Path(self.profile_dir).resolve()}",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-dev-shm-usage",
@@ -327,10 +334,87 @@ class ChromiumProcess:
             args.insert(1, "--no-sandbox")
         return args
 
-    def _clear_profile_locks(self) -> None:
-        for lock in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
-            with contextlib.suppress(FileNotFoundError):
+    def _clear_profile_locks(self) -> bool:
+        """Remove stale profile locks. Returns True if a lock could not be
+        removed because a live process still holds it (on Windows the
+        exclusive `lockfile`; unlink then fails with WinError 5/32)."""
+        held = False
+        for lock in ("SingletonLock", "SingletonSocket", "SingletonCookie",
+                     "lockfile"):
+            try:
                 (self.profile_dir / lock).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                held = True
+        return held
+
+    @staticmethod
+    def _win_profile_pids(profile_dir: Path,
+                          aliases: list[str] | None = None) -> list[int]:
+        """PIDs of chrome.exe processes launched with --user-data-dir pointing
+        at ``profile_dir`` (Windows only). A process matches only when its
+        --user-data-dir equals the absolute profile path or the exact
+        relative spelling the gateway used; regular Chrome has no
+        --user-data-dir flag and is never matched. No-op ([]) elsewhere."""
+        if sys.platform != "win32":
+            return []
+        targets = _norm_variants(str(profile_dir))
+        for alias in aliases or []:
+            targets |= _norm_variants(alias)
+        script = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+                  "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }")
+        stdout, error = _run_scan_command(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            timeout=20)
+        if error:
+            log.warning("profile holder scan inconclusive: %s", error)
+            return []
+        pids: list[int] = []
+        for proc in parse_process_lines(stdout.splitlines()):
+            if proc.pid == os.getpid():
+                continue
+            match = _WIN_USER_DATA_DIR_RE.search(proc.command_line)
+            if not match:
+                continue
+            value = match.group(1) or match.group(2) or match.group(3)
+            if value and _norm_variants(value) & targets:
+                pids.append(proc.pid)
+        return pids
+
+    def _reap_profile_procs(self, profile_dir: Path,
+                            aliases: list[str] | None = None) -> None:
+        """Kill leftover chrome.exe processes launched with our profile dir
+        (Windows only; no-op elsewhere, regular Chrome is never matched)."""
+        pids = self._win_profile_pids(profile_dir, aliases)
+        for pid in pids:
+            log.warning("stopping leftover Chromium for profile %s (PID %s)",
+                        profile_dir, pid)
+            with contextlib.suppress(OSError):
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                               capture_output=True, timeout=15)
+        if pids:
+            time.sleep(1.0)
+
+    def _throwaway_profile(self) -> Path:
+        """Fresh profile dir used when the primary one is held by a live
+        process; account cookies live in the gateway JSON store, not in
+        the Chrome profile, so switching profiles loses nothing."""
+        return (self._profile_primary.parent
+                / f"{self._profile_primary.name}-{os.getpid()}")
+
+    def _remove_throwaway_profiles(self) -> None:
+        parent = self._profile_primary.parent
+        if not parent.is_dir():
+            return
+        prefix = self._profile_primary.name + "-"
+        for child in parent.iterdir():
+            # Only PID-suffixed throwaways (browser-profile-<digits>), never
+            # a user folder that merely shares the prefix.
+            if (child.name.startswith(prefix)
+                    and child.name[len(prefix):].isdigit()
+                    and child.is_dir()):
+                shutil.rmtree(child, ignore_errors=True)
 
     def _preflight(self) -> None:
         """Fail fast, with the cause, when the profile or the debug port is taken."""
@@ -377,28 +461,81 @@ class ChromiumProcess:
             log.info("attached to existing Chromium on port %s", self.port)
             return url
 
+        # Resolve the profile to an absolute path first: on Windows a
+        # relative --user-data-dir never textually matches the absolute
+        # spelling a leftover Chromium reports, so the holder scan misses
+        # it. Remember the primary so a second start() never mistakes a
+        # throwaway profile for it.
+        if not hasattr(self, "_profile_primary"):
+            self._profile_primary = self.profile_dir.resolve()
+            self._profile_alias = str(self.profile_dir)
+        self.profile_dir = self._profile_primary
+
+        async def reap(why: str) -> None:
+            log.info("reaping leftover Chromium processes for profile %s (%s)",
+                     self.profile_dir, why)
+            await asyncio.to_thread(
+                self._reap_profile_procs, self.profile_dir,
+                [self._profile_alias])
+
+        # Clear out orphans from earlier runs and old throwaway profiles.
+        await reap("startup")
+        self._remove_throwaway_profiles()
+
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         for warning in profile_dir_warnings(self.profile_dir, self.data_dir):
             log.warning("%s", warning)
+
+        if self._clear_profile_locks():
+            # The Windows lockfile could not be removed: a live process
+            # still holds the profile. Reap once more and retry; if it is
+            # still held, give up on the primary and use a fresh throwaway.
+            await reap("locked profile")
+            await asyncio.sleep(1)
+            if self._clear_profile_locks():
+                self.profile_dir = self._throwaway_profile()
+                log.warning("profile %s is held by a live process; using "
+                            "throwaway profile %s",
+                            self._profile_primary, self.profile_dir)
+                self.profile_dir.mkdir(parents=True, exist_ok=True)
+
         await self._scan_holders()
         self._preflight()
-        self._clear_profile_locks()
 
-        args = self._chrome_args()
-        log.info("launching Chromium: %s", subprocess.list2cmdline(args))
-        self._log_handle = await asyncio.to_thread(
-            self.output_log.open, "a", encoding="utf-8")
-        self.proc = await asyncio.create_subprocess_exec(
-            *args, stdout=self._log_handle, stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,
-        )
-        for _ in range(60):
-            if url := await self.browser_ws_url():
+        async def launch() -> str | None:
+            if self._log_handle is not None:
+                self._log_handle.close()
+                self._log_handle = None
+            args = self._chrome_args()
+            self._last_args = args
+            log.info("launching Chromium: %s", subprocess.list2cmdline(args))
+            self._log_handle = await asyncio.to_thread(
+                self.output_log.open, "a", encoding="utf-8")
+            self.proc = await asyncio.create_subprocess_exec(
+                *args, stdout=self._log_handle, stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+            )
+            for _ in range(60):
+                if url := await self.browser_ws_url():
+                    return url
+                if self.proc.returncode is not None:
+                    return None
+                await asyncio.sleep(0.5)
+            return None
+
+        url = await launch()
+        if url is not None:
+            return url
+        if self.proc is not None and self.proc.returncode == self.PROFILE_IN_USE:
+            # A holder appeared after the preflight (or the lock survived
+            # it): reap once and retry on a fresh throwaway profile.
+            await reap("exit 21")
+            self.profile_dir = self._throwaway_profile()
+            self.profile_dir.mkdir(parents=True, exist_ok=True)
+            url = await launch()
+            if url is not None:
                 return url
-            if self.proc.returncode is not None:
-                break
-            await asyncio.sleep(0.5)
-        raise RuntimeError(self._failure_message(args))
+        raise RuntimeError(self._failure_message(self._last_args))
 
     def _profile_in_use_section(self) -> str:
         lines = ["Chromium exited with code 21 (RESULT_CODE_PROFILE_IN_USE): "
